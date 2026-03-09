@@ -1,6 +1,6 @@
-FROM python:3.11-slim
+FROM python:3.11-slim AS builder
 
-# Install Node.js 20 for building the JupyterLab extension
+# Build-only toolchain for the JupyterLab extension (not kept in runtime image).
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates curl gnupg && \
     mkdir -p /etc/apt/keyrings && \
@@ -12,37 +12,57 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends nodejs && \
     rm -rf /var/lib/apt/lists/*
 
-RUN useradd -m -u 1000 user
-
-RUN pip install --no-cache-dir \
-    torch --index-url https://download.pytorch.org/whl/cpu && \
+RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir \
-    jupyterlab>=4.0 \
-    numpy \
-    hatch-jupyter-builder>=0.5
+      build \
+      "jupyterlab>=4.0" \
+      "hatch-jupyter-builder>=0.5"
+
+WORKDIR /src
+
+# Build torch_judge wheel.
+COPY pyproject.toml setup.py README.md ./
+COPY torch_judge/ ./torch_judge/
+RUN python -m build --wheel --outdir /tmp/wheels .
+
+# Build precompiled JupyterLab extension wheel.
+# Copy manifests first so dependency install is cacheable between source edits.
+WORKDIR /src/labextension
+COPY labextension/package.json labextension/pyproject.toml labextension/tsconfig.json labextension/install.json ./
+COPY labextension/style ./style
+COPY labextension/src ./src
+COPY labextension/torchcode_labext ./torchcode_labext
+RUN jlpm install && jlpm run build:prod
+
+WORKDIR /src
+RUN python -m build --wheel --outdir /tmp/wheels ./labextension
+
+
+FROM python:3.11-slim AS runtime
+
+RUN useradd -m -u 1000 user
 
 WORKDIR /app
 
-COPY torch_judge/ ./torch_judge/
-COPY setup.py ./
-RUN pip install --no-cache-dir -e .
-
-# Build the JupyterLab extension: JS first, then Python install
-COPY labextension/ ./labextension/
-RUN cd labextension && jlpm install && jlpm run build:prod
-RUN cd labextension && pip install --no-cache-dir .
+COPY --from=builder /tmp/wheels /tmp/wheels
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir \
+      torch --index-url https://download.pytorch.org/whl/cpu && \
+    pip install --no-cache-dir \
+      /tmp/wheels/*.whl && \
+    rm -rf /tmp/wheels
 
 COPY templates/ ./templates/
 COPY solutions/ ./solutions/
 COPY entrypoint.sh ./
 RUN chmod +x /app/entrypoint.sh
 
-# JupyterLab custom settings: fonts, theme, Simple mode, disable news
+# JupyterLab custom settings: fonts, theme, Simple mode, disable news.
 COPY jupyter_config/overrides.json /tmp/overrides.json
 RUN LAB_DIR=$(jupyter lab path 2>/dev/null | grep "Application" | head -1 | sed 's/.*: *//') && \
     mkdir -p "$LAB_DIR/settings" && \
     cp /tmp/overrides.json "$LAB_DIR/settings/overrides.json" && \
-    echo "overrides.json → $LAB_DIR/settings/"
+    echo "overrides.json -> $LAB_DIR/settings/"
 
 RUN mkdir -p /app/notebooks /app/data && \
     chown -R user:user /app
